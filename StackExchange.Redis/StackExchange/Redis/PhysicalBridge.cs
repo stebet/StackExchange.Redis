@@ -16,7 +16,7 @@ namespace StackExchange.Redis
         CompetingWriter,
         NoConnection,
     }
-
+    
     sealed partial class PhysicalBridge : IDisposable
     {
         internal readonly string Name;
@@ -27,8 +27,7 @@ namespace StackExchange.Redis
 
         const double ProfileLogSeconds = (ConnectionMultiplexer.MillisecondsPerHeartbeat * ProfileLogSamples) / 1000.0;
 
-        private static readonly Message
-                                           ReusableAskingCommand = Message.Create(-1, CommandFlags.FireAndForget, RedisCommand.ASKING);
+        private static readonly Message ReusableAskingCommand = Message.Create(-1, CommandFlags.FireAndForget, RedisCommand.ASKING);
 
         private readonly CompletionManager completionManager;
         readonly long[] profileLog = new long[ProfileLogSamples];
@@ -48,6 +47,7 @@ namespace StackExchange.Redis
         int profileLogIndex;
         volatile bool reportNextFailure = true, reconfigureNextFailure = false;
         private volatile int state = (int)State.Disconnected;
+
         public PhysicalBridge(ServerEndPoint serverEndPoint, ConnectionType type)
         {
             ServerEndPoint = serverEndPoint;
@@ -64,6 +64,8 @@ namespace StackExchange.Redis
             ConnectedEstablished,
             Disconnected
         }
+
+        public Exception LastException { get; private set; }
 
         public ConnectionType ConnectionType { get; }
 
@@ -264,7 +266,7 @@ namespace StackExchange.Redis
                 Multiplexer.Trace("Enqueue: " + msg);
                 if (!TryEnqueue(msg, ServerEndPoint.IsSlave))
                 {
-                    OnInternalError(ExceptionFactory.NoConnectionAvailable(Multiplexer.IncludeDetailInExceptions, msg.Command, msg, ServerEndPoint));
+                    OnInternalError(ExceptionFactory.NoConnectionAvailable(Multiplexer.IncludeDetailInExceptions, Multiplexer.IncludePerformanceCountersInExceptions, msg.Command, msg, ServerEndPoint, Multiplexer.GetServerSnapshot()));
                 }
             }
         }
@@ -302,6 +304,7 @@ namespace StackExchange.Redis
         {
             if (reportNextFailure)
             {
+                LastException = innerException;
                 reportNextFailure = false; // until it is restored
                 var endpoint = ServerEndPoint.EndPoint;
                 Multiplexer.OnConnectionFailed(endpoint, ConnectionType, failureType, innerException, reconfigureNextFailure);
@@ -313,9 +316,8 @@ namespace StackExchange.Redis
             Trace("OnDisconnected");
 
             // if the next thing in the pipe is a PING, we can tell it that we failed (this really helps spot doomed connects)
-            // note that for simplicity we haven't removed it from the queue; that's OK
             int count;
-            var ping = queue.PeekPing(out count);
+            var ping = queue.DequeueUnsentPing(out count);
             if (ping != null)
             {
                 Trace("Marking PING as failed (queue length: " + count + ")");
@@ -350,6 +352,7 @@ namespace StackExchange.Redis
             if (physical == connection && !isDisposed && ChangeState(State.ConnectedEstablishing, State.ConnectedEstablished))
             {
                 reportNextFailure = reconfigureNextFailure = true;
+                LastException = null;
                 Interlocked.Exchange(ref failConnectCount, 0);
                 ServerEndPoint.OnFullyEstablished(connection);
                 Multiplexer.RequestWrite(this, true);
@@ -362,6 +365,8 @@ namespace StackExchange.Redis
         }
 
         private int connectStartTicks;
+        private long connectTimeoutRetryCount = 0;
+        
         internal void OnHeartbeat(bool ifConnectedOnly)
         {
             bool runThisTime = false;
@@ -379,8 +384,11 @@ namespace StackExchange.Redis
                 {
                     case (int)State.Connecting:
                         int connectTimeMilliseconds = unchecked(Environment.TickCount - VolatileWrapper.Read(ref connectStartTicks));
-                        if (connectTimeMilliseconds >= Multiplexer.RawConfig.ConnectTimeout)
+                        bool shouldRetry = Multiplexer.RawConfig.ReconnectRetryPolicy.ShouldRetry(Interlocked.Read(ref connectTimeoutRetryCount), connectTimeMilliseconds);
+                        if (shouldRetry)
                         {
+                            Interlocked.Increment(ref connectTimeoutRetryCount);
+                            LastException = ExceptionFactory.UnableToConnect(Multiplexer.RawConfig.AbortOnConnectFail, "ConnectTimeout");
                             Trace("Aborting connect");
                             // abort and reconnect
                             var snapshot = physical;
@@ -402,6 +410,7 @@ namespace StackExchange.Redis
                         {
                             if(state == (int)State.ConnectedEstablished)
                             {
+                                Interlocked.Exchange(ref connectTimeoutRetryCount, 0);
                                 tmp.Bridge.ServerEndPoint.ClearUnselectable(UnselectableFlags.DidNotRespond);
                             }
                             tmp.OnHeartbeat();
@@ -438,6 +447,7 @@ namespace StackExchange.Redis
                         }
                         break;
                     case (int)State.Disconnected:
+                        Interlocked.Exchange(ref connectTimeoutRetryCount, 0);
                         if (!ifConnectedOnly)
                         {
                             AbortUnsent();
@@ -446,6 +456,7 @@ namespace StackExchange.Redis
                         }
                         break;
                     default:
+                        Interlocked.Exchange(ref connectTimeoutRetryCount, 0);
                         if (!ifConnectedOnly)
                         {
                             AbortUnsent();
@@ -801,6 +812,7 @@ namespace StackExchange.Redis
                             connection.SetUnknownDatabase();
                         }
                         break;
+                    case RedisCommand.UNKNOWN:
                     case RedisCommand.DISCARD:
                     case RedisCommand.EXEC:
                         connection.SetUnknownDatabase();

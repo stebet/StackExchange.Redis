@@ -2,6 +2,7 @@
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Security.Authentication;
 using System.Threading.Tasks;
 using NUnit.Framework;
 using StackExchange.Redis;
@@ -188,45 +189,95 @@ namespace Tests
         }
 
         [Test]
-        public void AbortConnectFalseForAzure()
+        public void SslProtocols_SingleValue()
+        {
+            var log = new StringWriter();
+            var options = ConfigurationOptions.Parse("myhost,sslProtocols=Tls11");
+            Assert.AreEqual(SslProtocols.Tls11, options.SslProtocols.Value);
+        }
+
+        [Test]
+        public void SslProtocols_MultipleValues()
+        {
+            var log = new StringWriter();
+            var options = ConfigurationOptions.Parse("myhost,sslProtocols=Tls11|Tls12");
+            Assert.AreEqual(SslProtocols.Tls11|SslProtocols.Tls12, options.SslProtocols.Value);
+        }
+
+        [Test]
+        public void SslProtocols_UsingIntegerValue()
+        {
+            var log = new StringWriter();
+
+            // The below scenario is for cases where the *targeted*
+            // .NET framework version (e.g. .NET 4.0) doesn't define an enum value (e.g. Tls11)
+            // but the OS has been patched with support
+            int integerValue = (int)(SslProtocols.Tls11 | SslProtocols.Tls12);
+            var options = ConfigurationOptions.Parse("myhost,sslProtocols=" + integerValue);
+            Assert.AreEqual(SslProtocols.Tls11 | SslProtocols.Tls12, options.SslProtocols.Value);
+        }
+
+        [Test]
+        public void SslProtocols_InvalidValue()
+        {
+            var log = new StringWriter();
+            Assert.Throws<ArgumentOutOfRangeException>(() => ConfigurationOptions.Parse("myhost,sslProtocols=InvalidSslProtocol"));            
+        }
+
+        [Test]
+        public void ConfigurationOptionsDefaultForAzure()
         {
             var options = ConfigurationOptions.Parse("contoso.redis.cache.windows.net");
+            Assert.IsTrue(options.DefaultVersion.Equals(new Version(3, 0, 0)));
             Assert.IsFalse(options.AbortOnConnectFail);
         }
 
         [Test]
-        public void AbortConnectTrueForAzureWhenSpecified()
+        public void ConfigurationOptionsForAzureWhenSpecified()
         {
-            var options = ConfigurationOptions.Parse("contoso.redis.cache.windows.net,abortConnect=true");
+            var options = ConfigurationOptions.Parse("contoso.redis.cache.windows.net,abortConnect=true, version=2.1.1");
+            Assert.IsTrue(options.DefaultVersion.Equals(new Version(2, 1, 1)));
             Assert.IsTrue(options.AbortOnConnectFail);
         }
 
         [Test]
-        public void AbortConnectFalseForAzureChina()
+        public void ConfigurationOptionsDefaultForAzureChina()
         {
             // added a few upper case chars to validate comparison
             var options = ConfigurationOptions.Parse("contoso.REDIS.CACHE.chinacloudapi.cn");
+            Assert.IsTrue(options.DefaultVersion.Equals(new Version(3, 0, 0)));
             Assert.IsFalse(options.AbortOnConnectFail);
         }
 
         [Test]
-        public void AbortConnectFalseForAzureUSGov()
+        public void ConfigurationOptionsDefaultForAzureGermany()
+        {
+            var options = ConfigurationOptions.Parse("contoso.redis.cache.cloudapi.de");
+            Assert.IsTrue(options.DefaultVersion.Equals(new Version(3, 0, 0)));
+            Assert.IsFalse(options.AbortOnConnectFail);
+        }
+
+        [Test]
+        public void ConfigurationOptionsDefaultForAzureUSGov()
         {
             var options = ConfigurationOptions.Parse("contoso.redis.cache.usgovcloudapi.net");
+            Assert.IsTrue(options.DefaultVersion.Equals(new Version(3, 0, 0)));
             Assert.IsFalse(options.AbortOnConnectFail);
         }
 
         [Test]
-        public void AbortConnectTrueForNonAzure()
+        public void ConfigurationOptionsDefaultForNonAzure()
         {
             var options = ConfigurationOptions.Parse("redis.contoso.com");
+            Assert.IsTrue(options.DefaultVersion.Equals(new Version(2, 0, 0)));
             Assert.IsTrue(options.AbortOnConnectFail);
         }
 
         [Test]
-        public void AbortConnectDefaultWhenNoEndpointsSpecifiedYet()
+        public void ConfigurationOptionsDefaultWhenNoEndpointsSpecifiedYet()
         {
             var options = new ConfigurationOptions();
+            Assert.IsTrue(options.DefaultVersion.Equals(new Version(2, 0, 0)));
             Assert.IsTrue(options.AbortOnConnectFail);
         }
 

@@ -9,25 +9,26 @@ namespace Tests
 {
     class Program
     {
-        static void Main()
-        {
-            try
-            {
-                Main2();
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine();
-                Console.WriteLine("CRAZY ERRORS: " + ex);
-            }
-            finally
-            {
-                Console.WriteLine("Press any key to exit");
-                Console.ReadKey();
-            }
-        }
+        // static void Main()
+        // {
+        //     try
+        //     {
+        //         Main2();
+        //     }
+        //     catch (Exception ex)
+        //     {
+        //         Console.WriteLine();
+        //         Console.WriteLine("CRAZY ERRORS: " + ex);
+        //     }
+        //     finally
+        //     {
+        //         Console.WriteLine("Press any key to exit");
+        //         Console.ReadKey();
+        //     }
+        // }
         static void Main2()
         {
+#if !CORE_CLR
             // why is this here? because some dumbass forgot to install a decent test-runner before going to the airport
             var epicFail = new List<string>();
             var testTypes = from type in typeof(Program).Assembly.GetTypes()
@@ -39,8 +40,8 @@ namespace Tests
                                 Type = type,
                                 Methods = methods,
                                 ActiveMethods = methods.Where(x => Attribute.IsDefined(x, typeof(ActiveTestAttribute))).ToArray(),
-                                Setup = methods.SingleOrDefault(x => Attribute.IsDefined(x, typeof(TestFixtureSetUpAttribute))),
-                                TearDown = methods.SingleOrDefault(x => Attribute.IsDefined(x, typeof(TestFixtureTearDownAttribute)))
+                                Setup = methods.SingleOrDefault(x => Attribute.IsDefined(x, typeof(OneTimeSetUpAttribute))),
+                                TearDown = methods.SingleOrDefault(x => Attribute.IsDefined(x, typeof(OneTimeTearDownAttribute)))
                             };
             int pass = 0, fail = 0;
 
@@ -163,6 +164,7 @@ namespace Tests
 //                BookSleeve.RedisConnectionBase.AllSyncCallbacks, BookSleeve.RedisConnectionBase.AllAsyncCallbacks);
 //#endif
 
+#endif
         }
     }
 }

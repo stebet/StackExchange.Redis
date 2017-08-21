@@ -90,6 +90,7 @@ namespace StackExchange.Redis
 
             switch(message.Command)
             {
+                case RedisCommand.UNKNOWN:
                 case RedisCommand.EVAL:
                 case RedisCommand.EVALSHA:
                     // people can do very naughty things in an EVAL
@@ -176,8 +177,6 @@ namespace StackExchange.Redis
             static readonly ConditionResult[] NixConditions = new ConditionResult[0];
 
             static readonly QueuedMessage[] NixMessages = new QueuedMessage[0];
-
-            static readonly Message SharedMulti = Message.Create(-1, CommandFlags.None, RedisCommand.MULTI);
 
             private ConditionResult[] conditions;
 
@@ -276,7 +275,7 @@ namespace StackExchange.Redis
                     if (!IsAborted)
                     {
                         multiplexer.Trace("Begining transaction");
-                        yield return SharedMulti;
+                        yield return Message.Create(-1, CommandFlags.None, RedisCommand.MULTI);
                     }
 
                     // PART 3: issue the commands

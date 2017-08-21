@@ -206,6 +206,17 @@ namespace StackExchange.Redis
             return ExecuteAsync(msg, ResultProcessor.Int64);
         }
 
+        public RedisValue Echo(RedisValue message, CommandFlags flags)
+        {
+            var msg = Message.Create(-1, flags, RedisCommand.ECHO, message);
+            return ExecuteSync(msg, ResultProcessor.RedisValue);
+        }
+        public Task<RedisValue> EchoAsync(RedisValue message, CommandFlags flags)
+        {
+            var msg = Message.Create(-1, flags, RedisCommand.ECHO, message);
+            return ExecuteAsync(msg, ResultProcessor.RedisValue);
+        }
+
         public void FlushAllDatabases(CommandFlags flags = CommandFlags.None)
         {
             var msg = Message.Create(-1, flags, RedisCommand.FLUSHALL);
@@ -542,7 +553,7 @@ namespace StackExchange.Redis
 
                 // no need to deny exec-sync here; will be complete before they see if
                 var tcs = TaskSource.Create<T>(asyncState);
-                ConnectionMultiplexer.ThrowFailed(tcs, ExceptionFactory.NoConnectionAvailable(multiplexer.IncludeDetailInExceptions, message.Command, message, server));
+                ConnectionMultiplexer.ThrowFailed(tcs, ExceptionFactory.NoConnectionAvailable(multiplexer.IncludeDetailInExceptions, multiplexer.IncludePerformanceCountersInExceptions, message.Command, message, server, multiplexer.GetServerSnapshot()));
                 return tcs.Task;
             }
             return base.ExecuteAsync<T>(message, processor, server);
@@ -555,7 +566,7 @@ namespace StackExchange.Redis
             if (!server.IsConnected)
             {
                 if (message == null || message.IsFireAndForget) return default(T);
-                throw ExceptionFactory.NoConnectionAvailable(multiplexer.IncludeDetailInExceptions, message.Command, message, server);
+                throw ExceptionFactory.NoConnectionAvailable(multiplexer.IncludeDetailInExceptions, multiplexer.IncludePerformanceCountersInExceptions, message.Command, message, server, multiplexer.GetServerSnapshot());
             }
             return base.ExecuteSync<T>(message, processor, server);
         }

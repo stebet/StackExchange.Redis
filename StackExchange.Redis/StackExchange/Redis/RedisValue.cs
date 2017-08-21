@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 #if CORE_CLR
 using System.Collections.Generic;
 using System.Reflection;
@@ -206,17 +206,28 @@ namespace StackExchange.Redis
             result = 0;
             if (value == null || count <= 0) return false;
             checked
-            {   
-                bool neg = value[offset] == '-';
+            {
                 int max = offset + count;
-                for (int i = neg ? (offset + 1) : offset; i < max; i++)
+                if (value[offset] == '-')
                 {
-                    var b = value[i];
-                    if (b < '0' || b > '9') return false;
-                    result = (result * 10) + (b - '0');
+                    for (int i = offset + 1; i < max; i++)
+                    {
+                        var b = value[i];
+                        if (b < '0' || b > '9') return false;
+                        result = (result * 10) - (b - '0');
+                    }
+                    return true;
                 }
-                if (neg) result = -result;
-                return true;
+                else
+                {
+                    for (int i = offset; i < max; i++)
+                    {
+                        var b = value[i];
+                        if (b < '0' || b > '9') return false;
+                        result = (result * 10) + (b - '0');
+                    }
+                    return true;
+                }
             }
         }
 
@@ -269,7 +280,7 @@ namespace StackExchange.Redis
                 double thisDouble, otherDouble;
                 CompareType thisType = this.ResolveType(out thisInt64, out thisDouble),
                     otherType = other.ResolveType(out otherInt64, out otherDouble);
-            
+
                 if(thisType == CompareType.Null)
                 {
                     return otherType == CompareType.Null ? 0 : -1;
@@ -381,6 +392,21 @@ namespace StackExchange.Redis
             else if (value.Length == 0) blob = EmptyByteArr;
             else blob = value;
             return new RedisValue(0, blob);
+        }
+
+        internal static RedisValue Parse(object obj)
+        {
+            if (obj == null) return RedisValue.Null;
+            if (obj is RedisValue) return (RedisValue)obj;
+            if (obj is string) return (RedisValue)(string)obj;
+            if (obj is int) return (RedisValue)(int)obj;
+            if (obj is double) return (RedisValue)(double)obj;
+            if (obj is byte[]) return (RedisValue)(byte[])obj;
+            if (obj is bool) return (RedisValue)(bool)obj;
+            if (obj is long) return (RedisValue)(long)obj;
+            if (obj is float) return (RedisValue)(float)obj;
+
+            throw new InvalidOperationException("Unable to format type for redis: " + obj.GetType().FullName);
         }
         /// <summary>
         /// Creates a new RedisValue from a Boolean
@@ -500,8 +526,12 @@ namespace StackExchange.Redis
             if (valueBlob == IntegerSentinel)
                 return Format.ToString(value.valueInt64);
             if (valueBlob == null) return null;
-            
+
             if (valueBlob.Length == 0) return "";
+            if (valueBlob.Length == 2 && valueBlob[0] == (byte)'O' && valueBlob[1] == (byte)'K')
+            {
+                return "OK"; // special case for +OK status results from modules
+            }
             try
             {
                 return Encoding.UTF8.GetString(valueBlob);
@@ -586,7 +616,7 @@ namespace StackExchange.Redis
 
         /// <summary>
         /// Convert to a long if possible, returning true.
-        /// 
+        ///
         /// Returns false otherwise.
         /// </summary>
         public bool TryParse(out long val)
@@ -610,7 +640,7 @@ namespace StackExchange.Redis
 
         /// <summary>
         /// Convert to a int if possible, returning true.
-        /// 
+        ///
         /// Returns false otherwise.
         /// </summary>
         public bool TryParse(out int val)
@@ -628,7 +658,7 @@ namespace StackExchange.Redis
 
         /// <summary>
         /// Convert to a double if possible, returning true.
-        /// 
+        ///
         /// Returns false otherwise.
         /// </summary>
         public bool TryParse(out double val)

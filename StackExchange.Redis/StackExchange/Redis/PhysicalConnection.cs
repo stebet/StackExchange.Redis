@@ -32,6 +32,10 @@ namespace StackExchange.Redis
         {
             return result =>
             {   // can't capture AsyncState on SocketRead, so we'll do it once per physical instead
+                if (result.IsFaulted)
+                {
+                    GC.KeepAlive(result.Exception);
+                }
                 try
                 {
                     physical.Multiplexer.Trace("Completed asynchronously: processing in callback", physical.physicalName);
@@ -470,6 +474,27 @@ namespace StackExchange.Redis
             WriteRaw(outStream, arguments + 1);
             WriteUnified(outStream, commandBytes);
         }
+        internal const int REDIS_MAX_ARGS = 1024 * 1024; // there is a <= 1024*1024 max constraint inside redis itself: https://github.com/antirez/redis/blob/6c60526db91e23fb2d666fc52facc9a11780a2a3/src/networking.c#L1024
+
+        internal void WriteHeader(string command, int arguments)
+        {
+            if(arguments >= REDIS_MAX_ARGS) // using >= here because we will be adding 1 for the command itself (which is an arg for the purposes of the multi-bulk protocol)
+            {
+                throw ExceptionFactory.TooManyArgs(Multiplexer.IncludeDetailInExceptions, command, null, Bridge.ServerEndPoint, arguments + 1);
+            }
+            var commandBytes = Multiplexer.CommandMap.GetBytes(command);
+            if (commandBytes == null)
+            {
+                throw ExceptionFactory.CommandDisabled(Multiplexer.IncludeDetailInExceptions, command, null, Bridge.ServerEndPoint);
+            }
+            outStream.WriteByte((byte)'*');
+
+            // remember the time of the first write that still not followed by read
+            Interlocked.CompareExchange(ref firstUnansweredWriteTickCount, Environment.TickCount, 0);
+
+            WriteRaw(outStream, arguments + 1);
+            WriteUnified(outStream, commandBytes);
+        }
 
         static void WriteRaw(Stream stream, long value, bool withLengthPrefix = false)
         {
@@ -690,7 +715,7 @@ namespace StackExchange.Redis
                     Multiplexer.Trace("Beginning async read...", physicalName);
 #if CORE_CLR
                     var result = netStream.ReadAsync(ioBuffer, ioBufferBytes, space);
-                    switch(result.Status)
+                    switch (result.Status)
                     {
                         case TaskStatus.RanToCompletion:
                         case TaskStatus.Faulted:
@@ -779,11 +804,13 @@ namespace StackExchange.Redis
                         );
                     try
                     {
-                        ssl.AuthenticateAsClient(host);
+                        ssl.AuthenticateAsClient(host, config.SslProtocols);
+
+                        Multiplexer.LogLocked(log, $"SSL connection established successfully using protocol: {ssl.SslProtocol}");
                     }
-                    catch (AuthenticationException)
+                    catch (AuthenticationException authexception)
                     {
-                        RecordConnectionFailed(ConnectionFailureType.AuthenticationFailure);
+                        RecordConnectionFailed(ConnectionFailureType.AuthenticationFailure, authexception);
                         Multiplexer.Trace("Encryption failure");
                         return SocketMode.Abort;
                     }
@@ -794,11 +821,7 @@ namespace StackExchange.Redis
 
                 int bufferSize = config.WriteBuffer;
                 this.netStream = stream;
-#if CORE_CLR
-                this.outStream = bufferSize <= 0 ? stream : new BufferedOutputStream(stream, bufferSize);
-#else
                 this.outStream = bufferSize <= 0 ? stream : new BufferedStream(stream, bufferSize);
-#endif
                 Multiplexer.LogLocked(log, "Connected {0}", Bridge);
 
                 Bridge.OnConnected(this, log);

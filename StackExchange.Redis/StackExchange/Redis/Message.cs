@@ -6,6 +6,7 @@ using System.Linq;
 using System.Runtime.Serialization;
 #endif
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace StackExchange.Redis
@@ -26,6 +27,40 @@ namespace StackExchange.Redis
     }
 
 
+/// <summary>
+/// Indicates the time allotted for a command or operation has expired.
+/// </summary>
+#if FEATURE_SERIALIZATION
+    [Serializable]
+#endif
+    public sealed class RedisTimeoutException : TimeoutException
+    {
+#if FEATURE_SERIALIZATION
+        private RedisTimeoutException(SerializationInfo info, StreamingContext ctx) : base(info, ctx)
+        {
+             Commandstatus = (CommandStatus) info.GetValue("commandStatus", typeof(CommandStatus));
+        }
+        /// <summary>
+        /// Serialization implementation; not intended for general usage
+        /// </summary>
+        public override void GetObjectData(SerializationInfo info, StreamingContext context)
+        {
+            base.GetObjectData(info, context);
+            info.AddValue("commandStatus", Commandstatus);
+        }
+#endif
+        internal RedisTimeoutException(string message, CommandStatus commandStatus) : base(message)
+        {
+            Commandstatus = commandStatus;
+        }
+
+        /// <summary>
+        /// status of the command while communicating with Redis
+        /// </summary>
+        public CommandStatus Commandstatus { get; }
+    }
+
+
 
     /// <summary>
     /// Indicates a connection fault when communicating with redis
@@ -39,6 +74,7 @@ namespace StackExchange.Redis
         private RedisConnectionException(SerializationInfo info, StreamingContext ctx) : base(info, ctx)
         {
             FailureType = (ConnectionFailureType)info.GetInt32("failureType");
+            CommandStatus = (CommandStatus)info.GetValue("commandStatus", typeof(CommandStatus));
         }
         /// <summary>
         /// Serialization implementation; not intended for general usage
@@ -47,22 +83,33 @@ namespace StackExchange.Redis
         {
             base.GetObjectData(info, context);
             info.AddValue("failureType", (int)FailureType);
+            info.AddValue("commandStatus", CommandStatus);
         }
 #endif
 
-        internal RedisConnectionException(ConnectionFailureType failureType, string message) : base(message)
+        internal RedisConnectionException(ConnectionFailureType failureType, string message) : this(failureType, message, null, CommandStatus.Unknown)
         {
-            FailureType = failureType;
         }
-        internal RedisConnectionException(ConnectionFailureType failureType, string message, Exception innerException) : base(message, innerException)
+
+        internal RedisConnectionException(ConnectionFailureType failureType, string message, Exception innerException) : this(failureType, message, innerException, CommandStatus.Unknown)
+        {
+        }
+
+        internal RedisConnectionException(ConnectionFailureType failureType, string message, Exception innerException, CommandStatus commandStatus) : base(message, innerException)
         {
             FailureType = failureType;
+            CommandStatus = commandStatus;
         }
 
         /// <summary>
         /// The type of connection failure
         /// </summary>
         public ConnectionFailureType FailureType { get; }
+
+        /// <summary>
+        /// status of the command while communicating with Redis
+        /// </summary>
+        public CommandStatus CommandStatus { get; }
     }
 
     /// <summary>
@@ -94,7 +141,7 @@ namespace StackExchange.Redis
 #if FEATURE_SERIALIZATION
         private RedisServerException(SerializationInfo info, StreamingContext ctx) : base(info, ctx) { }
 #endif
-        
+
         internal RedisServerException(string message) : base(message) { }
     }
 
@@ -153,7 +200,7 @@ namespace StackExchange.Redis
         private const CommandFlags UserSelectableFlags
             = CommandFlags.None | CommandFlags.DemandMaster | CommandFlags.DemandSlave
             | CommandFlags.PreferMaster | CommandFlags.PreferSlave
-            | CommandFlags.HighPriority | CommandFlags.FireAndForget | CommandFlags.NoRedirect;
+            | CommandFlags.HighPriority | CommandFlags.FireAndForget | CommandFlags.NoRedirect | CommandFlags.NoScriptCache;
 
         private CommandFlags flags;
         internal CommandFlags FlagsRaw { get { return flags; } set { flags = value; } }
@@ -192,6 +239,7 @@ namespace StackExchange.Redis
 
             createdDateTime = DateTime.UtcNow;
             createdTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
+            Status = CommandStatus.WaitingToBeSent;
         }
 
         internal void SetMasterOnly()
@@ -230,7 +278,10 @@ namespace StackExchange.Redis
             createdTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
             performance = ProfileStorage.NewAttachedToSameContext(oldPerformance, resendTo, isMoved);
             performance.SetMessage(this);
+            Status = CommandStatus.WaitingToBeSent;
         }
+
+        internal CommandStatus Status { get; private set; }
 
         public RedisCommand Command => command;
 
@@ -347,6 +398,29 @@ namespace StackExchange.Redis
         public static Message Create(int db, CommandFlags flags, RedisCommand command, RedisKey key, RedisValue value0, RedisValue value1, RedisValue value2)
         {
             return new CommandKeyValueValueValueMessage(db, flags, command, key, value0, value1, value2);
+        }
+
+        public static Message Create(int db, CommandFlags flags, RedisCommand command, RedisKey key, GeoEntry[] values)
+        {
+            if (values == null) throw new ArgumentNullException(nameof(values));
+            if (values.Length == 0)
+            {
+                throw new ArgumentOutOfRangeException(nameof(values));
+            }
+            if (values.Length == 1)
+            {
+                var value = values[0];
+                return Message.Create(db, flags, command, key, value.Longitude, value.Latitude, value.Member);
+            }
+            var arr = new RedisValue[3 * values.Length];
+            int index = 0;
+            foreach (var value in values)
+            {
+                arr[index++] = value.Longitude;
+                arr[index++] = value.Latitude;
+                arr[index++] = value.Member;
+            }
+            return new CommandKeyValuesMessage(db, flags, command, key, arr);
         }
 
         public static Message Create(int db, CommandFlags flags, RedisCommand command, RedisKey key, RedisValue value0, RedisValue value1, RedisValue value2, RedisValue value3)
@@ -495,13 +569,17 @@ namespace StackExchange.Redis
 
         public bool TryComplete(bool isAsync)
         {
-            if (resultBox != null)
+            //Ensure we can never call TryComplete on the same resultBox from two threads by grabbing it now
+            var currBox = Interlocked.Exchange(ref resultBox, null);
+            if (currBox != null)
             {
-                var ret = resultBox.TryComplete(isAsync);
+                var ret = currBox.TryComplete(isAsync);
 
-                if (ret && isAsync)
+                //in async mode TryComplete will have unwrapped and recycled resultBox
+                if (!(ret && isAsync))
                 {
-                    resultBox = null; // in async mode TryComplete will have unwrapped and recycled resultBox; ensure we no longer reference it via this message
+                    //put result box back if it was not already recycled
+                    Interlocked.Exchange(ref resultBox, currBox);
                 }
 
                 performance?.SetCompleted();
@@ -650,6 +728,7 @@ namespace StackExchange.Redis
 
         internal void SetRequestSent()
         {
+            Status = CommandStatus.Sent;
             performance?.SetRequestSent();
         }
 
@@ -902,7 +981,7 @@ namespace StackExchange.Redis
             public override int GetHashSlot(ServerSelectionStrategy serverSelectionStrategy)
             {
                 int slot = ServerSelectionStrategy.NoSlot;
-                for(int i = 0; i < keys.Length; i++)
+                for (int i = 0; i < keys.Length; i++)
                 {
                     slot = serverSelectionStrategy.CombineSlot(slot, keys[i]);
                 }

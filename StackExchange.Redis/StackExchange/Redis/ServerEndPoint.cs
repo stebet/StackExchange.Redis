@@ -7,6 +7,7 @@ using System.Net;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace StackExchange.Redis
@@ -25,7 +26,7 @@ namespace StackExchange.Redis
     {
         internal volatile ServerEndPoint Master;
         internal volatile ServerEndPoint[] Slaves = NoSlaves;
-        private static readonly Regex nameSanitizer = new Regex("[^!-~]", InternalRegexCompiledOption.Default);
+        private static readonly Regex nameSanitizer = new Regex("[^!-~]", RegexOptions.Compiled);
         private static readonly ServerEndPoint[] NoSlaves = new ServerEndPoint[0];
         private readonly EndPoint endpoint;
 
@@ -88,6 +89,34 @@ namespace StackExchange.Redis
             {
                 var tmp = interactive;
                 return tmp != null && tmp.IsConnected;
+            }
+        }
+
+        internal Exception LastException
+        {
+            get
+            {
+                var tmp1 = interactive;
+                var tmp2 = subscription;
+
+                //check if subscription endpoint has a better lastexception
+                if (tmp2 != null && tmp2.LastException != null)
+                {
+                    if (tmp2.LastException.Data.Contains("Redis-FailureType") && !tmp2.LastException.Data["Redis-FailureType"].ToString().Equals(ConnectionFailureType.UnableToConnect.ToString()))
+                    {
+                        return tmp2.LastException;
+                    }
+                }
+                return tmp1?.LastException;
+            }
+        }
+
+        internal PhysicalBridge.State ConnectionState
+        {
+            get
+            {
+                var tmp = interactive;
+                return tmp.ConnectionState;
             }
         }
 
@@ -186,7 +215,7 @@ namespace StackExchange.Redis
                 multiplexer.Trace("Updating cluster ranges...");
                 multiplexer.UpdateClusterRange(configuration);
                 multiplexer.Trace("Resolving genealogy...");
-                var thisNode = configuration.Nodes.FirstOrDefault(x => x.EndPoint == this.EndPoint);
+                var thisNode = configuration.Nodes.FirstOrDefault(x => x.EndPoint.Equals(this.EndPoint));
                 if (thisNode != null)
                 {
                     List<ServerEndPoint> slaves = null;
@@ -311,6 +340,10 @@ namespace StackExchange.Redis
                 WriteDirectOrQueueFireAndForget(connection, msg, ResultProcessor.ClusterNodes);
             }
         }
+
+        int _nextReplicaOffset;
+        internal uint NextReplicaOffset() // used to round-robin between multiple replicas
+            => (uint) System.Threading.Interlocked.Increment(ref _nextReplicaOffset);
 
         internal Task Close()
         {
@@ -503,17 +536,28 @@ namespace StackExchange.Redis
         }
         private int lastInfoReplicationCheckTicks;
 
+        private int _heartBeatActive;
         internal void OnHeartbeat()
         {
-            try
+            // don't overlap operations on an endpoint
+            if (Interlocked.CompareExchange(ref _heartBeatActive, 1, 0) == 0)
             {
-                interactive?.OnHeartbeat(false);
-                subscription?.OnHeartbeat(false);
-            } catch(Exception ex)
-            {
-                multiplexer.OnInternalError(ex, EndPoint);
-            }
+                try
+                {
 
+
+                    interactive?.OnHeartbeat(false);
+                    subscription?.OnHeartbeat(false);
+                }
+                catch (Exception ex)
+                {
+                    multiplexer.OnInternalError(ex, EndPoint);
+                }
+                finally
+                {
+                    Interlocked.Exchange(ref _heartBeatActive, 0);
+                }
+            }
         }
 
         internal Task<T> QueueDirectAsync<T>(Message message, ResultProcessor<T> processor, object asyncState = null, PhysicalBridge bridge = null)
@@ -524,7 +568,7 @@ namespace StackExchange.Redis
             if (bridge == null) bridge = GetBridge(message.Command);
             if (!bridge.TryEnqueue(message, isSlave))
             {
-                ConnectionMultiplexer.ThrowFailed(tcs, ExceptionFactory.NoConnectionAvailable(multiplexer.IncludeDetailInExceptions, message.Command, message, this));
+                ConnectionMultiplexer.ThrowFailed(tcs, ExceptionFactory.NoConnectionAvailable(multiplexer.IncludeDetailInExceptions, multiplexer.IncludePerformanceCountersInExceptions, message.Command, message, this, multiplexer.GetServerSnapshot()));
             }
             return tcs.Task;
         }

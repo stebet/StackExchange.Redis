@@ -5,6 +5,7 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Security;
+using System.Security.Authentication;
 using System.Text;
 using System.Threading.Tasks;
 
@@ -66,6 +67,17 @@ namespace StackExchange.Redis
                 return tmp;
             }
 
+            internal static SslProtocols ParseSslProtocols(string key, string value)
+            {
+                SslProtocols tmp;
+                //Flags expect commas as separators, but we need to use '|' since commas are already used in the connection string to mean something else
+                value = value?.Replace("|", ","); 
+
+                if (!Enum.TryParse(value, true, out tmp)) throw new ArgumentOutOfRangeException("Keyword '" + key + "' requires an SslProtocol value (multiple values separated by '|').");
+
+                return tmp;                
+            }
+
             internal static void Unknown(string key)
             {
                 throw new ArgumentException("Keyword '" + key + "' is not supported");
@@ -78,6 +90,8 @@ namespace StackExchange.Redis
                         ConfigChannel = "configChannel", AbortOnConnectFail = "abortConnect", ResolveDns = "resolveDns",
                         ChannelPrefix = "channelPrefix", Proxy = "proxy", ConnectRetry = "connectRetry",
                         ConfigCheckSeconds = "configCheckSeconds", ResponseTimeout = "responseTimeout", DefaultDatabase = "defaultDatabase";
+            internal const string SslProtocols = "sslProtocols";
+
             private static readonly Dictionary<string, string> normalizedOptions = new[]
             {
                 AllowAdmin, SyncTimeout,
@@ -87,6 +101,7 @@ namespace StackExchange.Redis
                 ConfigChannel, AbortOnConnectFail, ResolveDns,
                 ChannelPrefix, Proxy, ConnectRetry,
                 ConfigCheckSeconds, DefaultDatabase,
+                SslProtocols,
             }.ToDictionary(x => x, StringComparer.OrdinalIgnoreCase);
 
             public static string TryNormalize(string value)
@@ -115,6 +130,8 @@ namespace StackExchange.Redis
 
         private Proxy? proxy;
 
+        private IReconnectRetryPolicy reconnectRetryPolicy; 
+
         /// <summary>
         /// A LocalCertificateSelectionCallback delegate responsible for selecting the certificate used for authentication; note
         /// that this cannot be specified in the configuration-string.
@@ -138,7 +155,7 @@ namespace StackExchange.Redis
         /// Indicates whether admin operations should be allowed
         /// </summary>
         public bool AllowAdmin { get { return allowAdmin.GetValueOrDefault(); } set { allowAdmin = value; } }
-
+                
         /// <summary>
         /// Indicates whether the connection should be encrypted
         /// </summary>
@@ -153,6 +170,11 @@ namespace StackExchange.Redis
         /// Indicates whether the connection should be encrypted
         /// </summary>
         public bool Ssl { get { return ssl.GetValueOrDefault(); } set { ssl = value; } }
+
+        /// <summary>
+        /// Configures which Ssl/TLS protocols should be allowed.  If not set, defaults are chosen by the .NET framework.
+        /// </summary>
+        public SslProtocols? SslProtocols { get; set; }
 
         /// <summary>
         /// Automatically encodes and decodes channels
@@ -208,9 +230,15 @@ namespace StackExchange.Redis
         }
 
         /// <summary>
+        /// The retry policy to be used for connection reconnects
+        /// </summary>
+        public IReconnectRetryPolicy ReconnectRetryPolicy { get { return reconnectRetryPolicy ?? (reconnectRetryPolicy = new LinearRetry(ConnectTimeout)); } set { reconnectRetryPolicy = value; } }
+
+
+        /// <summary>
         /// The server version to assume
         /// </summary>
-        public Version DefaultVersion { get { return defaultVersion ?? RedisFeatures.v2_0_0; } set { defaultVersion = value; } }
+        public Version DefaultVersion { get { return defaultVersion ?? (IsAzureEndpoint() ? RedisFeatures.v3_0_0 : RedisFeatures.v2_0_0); } set { defaultVersion = value; } }
 
         /// <summary>
         /// The endpoints defined for this configuration
@@ -233,7 +261,7 @@ namespace StackExchange.Redis
         public string Password { get { return password; } set { password = value; } }
 
         /// <summary>
-        /// Indicates whether admin operations should be allowed
+        /// Type of proxy to use (if any); for example Proxy.Twemproxy
         /// </summary>
         public Proxy Proxy { get { return proxy.GetValueOrDefault(); } set { proxy = value; } }
 
@@ -349,7 +377,11 @@ namespace StackExchange.Redis
                 connectRetry = connectRetry,
                 configCheckSeconds = configCheckSeconds,
                 responseTimeout = responseTimeout,
-				defaultDatabase = defaultDatabase,
+                defaultDatabase = defaultDatabase,
+                ReconnectRetryPolicy = reconnectRetryPolicy,
+#if !CORE_CLR
+                SslProtocols = SslProtocols,
+#endif
             };
             foreach (var item in endpoints)
                 options.endpoints.Add(item);
@@ -366,9 +398,20 @@ namespace StackExchange.Redis
         }
 
         /// <summary>
-        /// Returns the effective configuration string for this configuration
+        /// Returns the effective configuration string for this configuration, including Redis credentials.
         /// </summary>
         public override string ToString()
+        {
+            // include password to allow generation of configuration strings 
+            // used for connecting multiplexer
+            return ToString(includePassword: true);
+        }
+
+        /// <summary>
+        /// Returns the effective configuration string for this configuration
+        /// with the option to include or exclude the password from the string.
+        /// </summary>
+        public string ToString(bool includePassword)
         {
             var sb = new StringBuilder();
             foreach (var endpoint in endpoints)
@@ -382,7 +425,7 @@ namespace StackExchange.Redis
             Append(sb, OptionKeys.AllowAdmin, allowAdmin);
             Append(sb, OptionKeys.Version, defaultVersion);
             Append(sb, OptionKeys.ConnectTimeout, connectTimeout);
-            Append(sb, OptionKeys.Password, password);
+            Append(sb, OptionKeys.Password, includePassword ? password : "*****");
             Append(sb, OptionKeys.TieBreaker, tieBreaker);
             Append(sb, OptionKeys.WriteBuffer, writeBuffer);
             Append(sb, OptionKeys.Ssl, ssl);
@@ -602,6 +645,11 @@ namespace StackExchange.Redis
                         case OptionKeys.DefaultDatabase:
                             defaultDatabase = OptionKeys.ParseInt32(key, value);
                             break;
+#if !CORE_CLR
+                        case OptionKeys.SslProtocols:
+                            SslProtocols = OptionKeys.ParseSslProtocols(key, value);
+                            break;
+#endif
                         default:
                             if (!string.IsNullOrEmpty(key) && key[0] == '$')
                             {
@@ -640,7 +688,7 @@ namespace StackExchange.Redis
 
             return true;
         }
-
+        
         private bool IsAzureEndpoint()
         {
             var result = false; 
@@ -656,6 +704,7 @@ namespace StackExchange.Redis
                         case ".redis.cache.windows.net":
                         case ".redis.cache.chinacloudapi.cn":
                         case ".redis.cache.usgovcloudapi.net":
+                        case ".redis.cache.cloudapi.de":
                             return true;
                     }
                 }
